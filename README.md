@@ -28,6 +28,10 @@ Modules are added here as they are written.
 - Creating the network: VPC, subnet with Pod and Service ranges, Cloud NAT, applied by a GitHub Actions pipeline with keyless login and approval gates
 - Creating the GKE cluster: zonal Standard cluster with private nodes, DNS endpoint, Workload Identity, an on-demand system pool and a Spot apps pool; a reusable pipeline with static checks, change detection and a manual destroy workflow
 
+### [Module 03 - Installing Argo CD and the First Application](./03%20-%20Installing%20Argo%20CD%20and%20the%20First%20Application/README.md)
+
+- Installing Argo CD with Terraform: Helm release through the DNS endpoint, pinned chart version, values file, components on the system pool, UI through port-forward
+
 ## License
 
 [MIT](./LICENSE)
