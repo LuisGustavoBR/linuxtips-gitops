@@ -22,6 +22,10 @@ Modules are added here as they are written.
 - Argo CD components and what each one does
 - Anatomy of an Application: where (`destination`), what (`source`) and how (`syncPolicy`)
 
+### [Module 02 - GKE Platform with Terraform and GitHub Actions](./02%20-%20GKE%20Platform%20with%20Terraform%20and%20GitHub%20Actions/README.md)
+
+- Preparing the GCP project with `gcloud`: APIs, the Terraform state bucket, Workload Identity Federation and a least-privilege service account
+
 ## License
 
 [MIT](./LICENSE)
