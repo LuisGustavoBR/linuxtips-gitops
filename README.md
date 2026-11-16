@@ -25,6 +25,7 @@ Modules are added here as they are written.
 ### [Module 02 - GKE Platform with Terraform and GitHub Actions](./02%20-%20GKE%20Platform%20with%20Terraform%20and%20GitHub%20Actions/README.md)
 
 - Preparing the GCP project with `gcloud`: APIs, the Terraform state bucket, Workload Identity Federation and a least-privilege service account
+- Creating the network: VPC, subnet with Pod and Service ranges, Cloud NAT, applied by a GitHub Actions pipeline with keyless login and approval gates
 
 ## License
 

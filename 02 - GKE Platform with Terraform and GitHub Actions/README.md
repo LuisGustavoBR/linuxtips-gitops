@@ -22,6 +22,13 @@ So the first lesson prepares these by hand, with `gcloud` commands in the Cloud 
   - [6. Allow GitHub Actions to Use the Service Account](#6-allow-github-actions-to-use-the-service-account)
   - [7. Configure GitHub](#7-configure-github)
   - [8. Check Everything](#8-check-everything)
+- [Lesson 2: Creating the Network](#lesson-2-creating-the-network)
+  - [1. What We Are Creating](#1-what-we-are-creating)
+  - [2. The Terraform Files](#2-the-terraform-files)
+  - [3. The Workflow](#3-the-workflow)
+  - [4. Run It](#4-run-it)
+  - [5. Check the Result](#5-check-the-result)
+  - [6. If Something Fails](#6-if-something-fails)
 
 ---
 
@@ -283,7 +290,7 @@ gcloud iam service-accounts get-iam-policy "$SA_EMAIL"
 
 Expected output: `roles/iam.workloadIdentityUser` for the `principal://.../environment:lab` member.
 
-The real test, GitHub Actions actually logging in, happens in the next lesson, when the pipeline runs for the first time.
+The real test, GitHub Actions actually logging in, happens in the next lesson, when the pipeline creates the network.
 
 ## Key Takeaways
 
@@ -293,3 +300,367 @@ The real test, GitHub Actions actually logging in, happens in the next lesson, w
 - The attribute condition makes the pool accept tokens from our repository only.
 - The `terraform` service account gets only the roles it needs, and its IAM admin role is limited by a condition.
 - Only jobs in the `lab` environment, which you approve, can use it.
+
+---
+
+# Lesson 2: Creating the Network
+
+Now Terraform starts working, through the pipeline. The first thing we create is the network the GKE cluster will live in.
+
+All the code is in the **[linuxtips-gitops-gke](https://github.com/LuisGustavoBR/linuxtips-gitops-gke)** repository:
+
+```txt
+# linuxtips-gitops-gke
+.github/workflows/terraform.yaml   # the pipeline
+network/                           # the network (a Terraform root module)
+  versions.tf                      # Terraform/provider versions and the backend
+  providers.tf                     # the Google provider
+  variables.tf                     # declares the inputs (names, IP ranges)
+  network.tf                       # the VPC and the subnet
+  nat.tf                           # Cloud Router and Cloud NAT
+  outputs.tf                       # what it prints at the end
+  envs/
+    lab.tfvars                     # the values of the lab environment
+  .terraform.lock.hcl              # exact provider versions (generated, committed)
+```
+
+Each top-level folder (`network/` now, `gke/` next) is a separate Terraform project, with its own code and its own state. Keeping them apart keeps each one small, and a mistake in one can't touch the others.
+
+## 1. What We Are Creating
+
+```mermaid
+flowchart TB
+  internet((Internet))
+  subgraph vpc["VPC gitops-vpc"]
+    subgraph subnet["Subnet gitops-hub (us-central1)"]
+      nodes["Nodes: 10.30.0.0/24"]
+      pods["Pods (secondary): 10.30.32.0/19"]
+      svcs["Services (secondary): 10.30.16.0/20"]
+    end
+    router[Cloud Router] --- nat[Cloud NAT]
+  end
+  nodes -- outbound only --> nat --> internet
+```
+
+| Resource | Why |
+|---|---|
+| **VPC** `gitops-vpc` | Our private network. In *custom mode*, Google creates no subnets by itself; we decide every range. |
+| **Subnet** `gitops-hub` | Where the hub cluster lives. It has **three IP ranges** (see below). |
+| **Cloud Router** + **Cloud NAT** | The nodes will have **no public IP**, so nothing on the internet can reach them directly. They still need to go *out* (pull images, clone GitHub repos), and Cloud NAT gives them that. |
+
+**Why three IP ranges?** GKE clusters are *VPC-native*: Pods and Services get real IPs from the VPC, not from an overlay network hidden inside the cluster. So the subnet has:
+
+| Range | CIDR | Size | Used for |
+|---|---|---|---|
+| primary | `10.30.0.0/24` | 256 IPs | one IP per **node** |
+| `hub-pods` (secondary) | `10.30.32.0/19` | 8,192 IPs | **Pods**. GKE gives each node a block of Pod IPs. |
+| `hub-services` (secondary) | `10.30.16.0/20` | 4,096 IPs | **Services** (ClusterIPs) |
+
+The ranges must not overlap with each other, or with any network you may connect later.
+
+## 2. The Terraform Files
+
+**The backend.** It tells Terraform to keep the state in the bucket from Lesson 1:
+
+```hcl
+# network/versions.tf
+terraform {
+  required_version = "~> 1.17"
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 8.11"
+    }
+  }
+
+  # The state lives in the GCS bucket created by hand (docs: Module 2, Lesson 1).
+  # bucket and prefix are passed by the pipeline with -backend-config,
+  # so no project-specific value is committed here.
+  backend "gcs" {}
+}
+```
+
+The `backend "gcs" {}` block is **empty on purpose** (a *partial* backend). The bucket name is passed when the pipeline runs `terraform init`, so the code works for any project.
+
+**The provider.** `project_id` has no default. The pipeline fills it from the GitHub variable `GCP_PROJECT_ID`, as the environment variable `TF_VAR_project_id` (Terraform reads any `TF_VAR_<name>` as the value of variable `<name>`):
+
+```hcl
+# network/providers.tf
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+```
+
+**The VPC and the subnet:**
+
+```hcl
+# network/network.tf (comments removed)
+resource "google_compute_network" "this" {
+  name                    = "${var.name_prefix}-vpc"
+  auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
+}
+
+resource "google_compute_subnetwork" "hub" {
+  name    = "${var.name_prefix}-hub"
+  region  = var.region
+  network = google_compute_network.this.id
+
+  ip_cidr_range = var.nodes_cidr
+
+  private_ip_google_access = true
+
+  secondary_ip_range {
+    range_name    = "hub-pods"
+    ip_cidr_range = var.pods_cidr
+  }
+
+  secondary_ip_range {
+    range_name    = "hub-services"
+    ip_cidr_range = var.services_cidr
+  }
+
+  log_config {
+    aggregation_interval = "INTERVAL_10_MIN"
+    flow_sampling        = 0.1
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+}
+```
+
+- `auto_create_subnetworks = false`: custom mode; only the subnets we declare exist.
+- `private_ip_google_access = true`: nodes without public IPs can still reach Google APIs (Artifact Registry, Cloud Logging) over Google's internal network.
+- `secondary_ip_range`: the Pod and Service ranges. The cluster will refer to them **by name** (`hub-pods`, `hub-services`).
+- `log_config`: **VPC flow logs**, a record of the connections in and out of the subnet, useful to investigate network or security problems. Sampling 10% of the flows keeps the cost low.
+
+**Cloud Router and Cloud NAT:**
+
+```hcl
+# network/nat.tf (excerpt)
+resource "google_compute_router" "this" {
+  name    = "${var.name_prefix}-router"
+  region  = var.region
+  network = google_compute_network.this.id
+}
+
+resource "google_compute_router_nat" "this" {
+  name   = "${var.name_prefix}-nat"
+  region = var.region
+  router = google_compute_router.this.name
+
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+```
+
+- The **Cloud Router** is the regional piece Cloud NAT runs on.
+- `AUTO_ONLY`: Google picks and manages the public IPs used for outbound traffic.
+- `ALL_SUBNETWORKS_ALL_IP_RANGES`: nodes and Pods of every subnet can use the NAT.
+
+**The values of each environment.** `variables.tf` only *declares* the inputs, with no defaults. The values live in one file per environment:
+
+```hcl
+# network/envs/lab.tfvars
+region      = "us-central1"
+name_prefix = "gitops"
+
+nodes_cidr    = "10.30.0.0/24"  # 256 node IPs
+services_cidr = "10.30.16.0/20" # 4,096 Service IPs
+pods_cidr     = "10.30.32.0/19" # 8,192 Pod IPs
+```
+
+For now there is only `lab`. Adding another environment later (say `develop`) means a new `envs/develop.tfvars` with its own names and ranges, and the difference between the two is visible in one small file. The same code always runs everywhere; only the values change.
+
+> **Note:** The repository's `.gitignore` ignores `*.tfvars` by default, because such files often hold secrets. We add an exception for `envs/*.tfvars`. They are committed on purpose, so **they must never contain a secret**. Even the project ID stays out: the pipeline passes it.
+
+## 3. The Workflow
+
+The pipeline has two jobs. Both run in the `lab` environment, so both wait for your approval:
+
+```mermaid
+flowchart LR
+  push[push to main] --> plan["plan job<br/>(approve #1)"]
+  plan -- "you read the plan<br/>in the job summary" --> apply["apply job<br/>(approve #2)"]
+```
+
+| Job | What it does |
+|---|---|
+| `plan` | logs in, runs `terraform init` and `terraform plan`, and writes the plan to the job **summary** |
+| `apply` | after you read the plan and approve, logs in again and runs `terraform apply` |
+
+The important parts:
+
+```yaml
+# .github/workflows/terraform.yaml (excerpt)
+on:
+  push:
+    branches: [main]
+    paths:
+      - "network/**"
+      - ".github/workflows/terraform.yaml"
+  workflow_dispatch:
+```
+
+The pipeline runs on every push to `main` that changes Terraform code, or by hand (**Actions → terraform → Run workflow**). A push that only changes a README doesn't trigger it.
+
+```yaml
+# .github/workflows/terraform.yaml (excerpt)
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+```
+
+- `permissions`: by default, jobs can only read the code.
+- `concurrency`: two runs never happen at the same time, because they would fight over the same state. A new run waits for the previous one.
+
+```yaml
+# .github/workflows/terraform.yaml (excerpt)
+  plan:
+    runs-on: ubuntu-24.04
+    environment: lab
+    permissions:
+      contents: read
+      id-token: write
+```
+
+- `environment: lab` is what makes the job wait for your approval. It is also what Google checks: the service account only trusts jobs in `lab` (Lesson 1, step 6).
+- `id-token: write` allows the job to ask GitHub for the OIDC token. Without it, there is nothing to exchange for Google credentials.
+
+```yaml
+# .github/workflows/terraform.yaml (excerpt)
+      - name: Log in to Google Cloud (Workload Identity Federation, no keys)
+        uses: google-github-actions/auth@v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+```
+
+This is where the login happens: the action exchanges the GitHub token for short-lived credentials of the `terraform` service account. Every later step (and Terraform) uses them automatically.
+
+> **Note:** Actions are pinned to an **exact version** (`@v3.0.0`), not to a floating major tag like `@v3`, which points to a new release every time one is published. Pinning means the pipeline only changes when we decide to update it. For even stricter security, you can pin to a full commit SHA: a tag can technically be moved by whoever controls the action's repository; a SHA can't.
+
+```yaml
+# .github/workflows/terraform.yaml
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ env.ENV }}/${{ env.TF_DIR }}"
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -no-color -var-file="envs/${{ env.ENV }}.tfvars" | tee plan.txt
+```
+
+- `terraform init` completes the partial backend. The bucket comes from the GitHub variable, and the prefix is `<environment>/<folder>`, so the state goes to `gs://<bucket>/lab/network/`. Each environment and each Terraform folder gets its own state: `develop` will never overwrite `lab`, and `gke/` will never touch the state of `network/`.
+- `-var-file` picks the values of the environment.
+- `ENV` and `TF_DIR` are set once at the top of the workflow (`ENV: lab`, `TF_DIR: network`), so changing them in one place changes every path.
+
+> **Note:** Why not write the bucket and prefix in `versions.tf`? Because the `backend` block **can't use variables**: Terraform reads it before any variable exists. That is why it stays empty and the values come from `-backend-config`.
+
+> **Note:** Why does the `apply` job run a fresh `terraform apply` instead of reusing the plan from the first job? Passing a plan file between jobs means uploading it as an artifact. In a public repository anyone can download artifacts, and plan files can contain sensitive values. Since only you push to `main` and runs never overlap, a fresh apply right after you read the plan is safe enough here.
+
+## 4. Run It
+
+Commit and push the code:
+
+```bash
+git add .gitignore .github network
+git commit -m "feat: add network and terraform pipeline"
+git push
+```
+
+Then, on GitHub:
+
+1. Open **Actions → terraform**. The run shows **Waiting**, because `plan` needs approval.
+2. Click **Review deployments**, check `lab` and click **Approve and deploy**.
+3. When `plan` finishes, open its **Summary** and read the plan. It should create four resources:
+
+   ```txt
+   Terraform will perform the following actions:
+
+     # google_compute_network.this will be created
+     # google_compute_router.this will be created
+     # google_compute_router_nat.this will be created
+     # google_compute_subnetwork.hub will be created
+     ...
+   Plan: 4 to add, 0 to change, 0 to destroy.
+   ```
+
+4. Now `apply` is waiting. Approve it the same way. It takes a minute or two and ends with:
+
+   ```txt
+   Apply complete! Resources: 4 added, 0 changed, 0 destroyed.
+
+   Outputs:
+
+   hub_secondary_ranges = {
+     "pods" = "hub-pods"
+     "services" = "hub-services"
+   }
+   hub_subnet = "gitops-hub"
+   network = "gitops-vpc"
+   ```
+
+## 5. Check the Result
+
+In the Cloud Shell (set `PROJECT_ID` again if the session is new):
+
+```bash
+gcloud compute networks list --filter="name=gitops-vpc"
+gcloud compute networks subnets describe gitops-hub --region us-central1 \
+  --format="yaml(ipCidrRange, privateIpGoogleAccess, secondaryIpRanges)"
+gcloud compute routers nats list --router gitops-router --region us-central1
+```
+
+The subnet should show `10.30.0.0/24`, `privateIpGoogleAccess: true` and the two secondary ranges.
+
+The state written by the pipeline is in the bucket:
+
+```bash
+gcloud storage ls "gs://${PROJECT_ID}-tfstate/lab/network/"
+```
+
+```txt
+gs://your-project-id-tfstate/lab/network/default.tfstate
+```
+
+From now on, every change to `network/` reads and updates that file.
+
+## 6. If Something Fails
+
+Login problems break in the **"Log in to Google Cloud"** step or in `terraform init`, before Terraform even reads the code. They point to a step of Lesson 1:
+
+| Error | Likely cause | Fix |
+|---|---|---|
+| `The given credential is rejected by the attribute condition` | the repository or owner ID in the provider condition is wrong | Lesson 1, steps 1 and 4: check `GITHUB_REPO_ID` / `GITHUB_OWNER_ID` |
+| `Permission 'iam.serviceAccounts.getAccessToken' denied` | the job is not allowed to use the service account (wrong repo name or environment in the `principal://` member) | Lesson 1, step 6 |
+| `Unable to retrieve ... id-token` / `ACTIONS_ID_TOKEN_REQUEST_URL` missing | the job lacks `id-token: write` | check the job's `permissions` |
+| `storage.objects.list access ... denied` in `terraform init` | the service account can't use the bucket | Lesson 1, step 5 (bucket binding) |
+| `Error: No value for required variable "project_id"` | the `GCP_PROJECT_ID` GitHub variable is missing or misspelled | Lesson 1, step 7 |
+| Job stuck in **Waiting** | it is waiting for your approval | **Review deployments** |
+
+Problems with the network itself show up later, in `plan` or `apply`:
+
+| Error | Likely cause | Fix |
+|---|---|---|
+| `Compute Engine API has not been used in project ... or it is disabled` | the `compute` API is not enabled | Lesson 1, step 2 |
+| `Required 'compute.networks.create' permission` | the service account lacks `compute.networkAdmin` | Lesson 1, step 5 |
+| `Invalid IPCidrRange` / `... overlaps with ...` | a range in `envs/lab.tfvars` is invalid or overlaps another one | fix the CIDRs in `envs/lab.tfvars` |
+| `No value for required variable "nodes_cidr"` (or another one) | the variable is missing from `envs/lab.tfvars` | add it to the file |
+
+## Key Takeaways
+
+- The platform is split into Terraform folders at the repository root, each with its own code and its own state; the first one is `network/`.
+- GKE is VPC-native: the subnet has a primary range for nodes and secondary ranges for Pods and Services.
+- Nodes will have no public IP; Cloud NAT gives them outbound internet access, and Private Google Access reaches Google APIs internally.
+- A partial backend keeps project-specific values out of the code; the pipeline passes them to `terraform init`.
+- `variables.tf` declares the inputs and `envs/<env>.tfvars` holds the values of each environment: same code everywhere, only the values change.
+- `environment: lab` makes every job wait for your approval and is what lets it use the service account; `id-token: write` plus `google-github-actions/auth` is the whole keyless login.
