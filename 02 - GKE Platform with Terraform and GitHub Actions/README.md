@@ -29,6 +29,14 @@ So the first lesson prepares these by hand, with `gcloud` commands in the Cloud 
   - [4. Run It](#4-run-it)
   - [5. Check the Result](#5-check-the-result)
   - [6. If Something Fails](#6-if-something-fails)
+- [Lesson 3: Creating the GKE Cluster](#lesson-3-creating-the-gke-cluster)
+  - [1. The Cluster We Are Creating](#1-the-cluster-we-are-creating)
+  - [2. The Terraform Files](#2-the-terraform-files-1)
+  - [3. A Pipeline That Grows with the Repository](#3-a-pipeline-that-grows-with-the-repository)
+  - [4. Run It](#4-run-it-1)
+  - [5. Connect with kubectl](#5-connect-with-kubectl)
+  - [6. Destroy and Recreate the Cluster](#6-destroy-and-recreate-the-cluster)
+  - [7. Troubleshooting the Cluster](#7-troubleshooting-the-cluster)
 
 ---
 
@@ -481,6 +489,8 @@ For now there is only `lab`. Adding another environment later (say `develop`) me
 
 ## 3. The Workflow
 
+> **Note:** This is the **first version** of the workflow, for a single folder. In Lesson 3, when the cluster arrives, it is restructured into a reusable workflow that scales to many folders. The ideas explained here (environment, keyless login, partial backend) stay exactly the same.
+
 The pipeline has two jobs. Both run in the `lab` environment, so both wait for your approval:
 
 ```mermaid
@@ -709,3 +719,475 @@ Problems with the network itself show up later, in `plan` or `apply`:
 - A partial backend keeps project-specific values out of the code; the pipeline passes them to `terraform init`.
 - `variables.tf` declares the inputs and `envs/<env>.tfvars` holds the values of each environment: same code everywhere, only the values change.
 - `environment: lab` makes every job wait for your approval and is what lets it use the service account; `id-token: write` plus `google-github-actions/auth` is the whole keyless login.
+
+---
+
+# Lesson 3: Creating the GKE Cluster
+
+With the network in place, we create the cluster everything else runs on. We call it the **hub**: later it will run Argo CD and manage other clusters.
+
+The code is a new folder in **[linuxtips-gitops-gke](https://github.com/LuisGustavoBR/linuxtips-gitops-gke)**, following the same pattern as `network/`:
+
+```txt
+# linuxtips-gitops-gke
+.github/workflows/     # restructured in this lesson (section 3)
+.tflint.hcl
+.trivyignore.yaml
+network/               # Lesson 2
+gke/
+  versions.tf          # same as network/ (backend "gcs" {})
+  providers.tf
+  variables.tf         # declares the inputs
+  data.tf              # looks up the network created by network/
+  service_account.tf   # the identity of the nodes
+  cluster.tf           # the cluster
+  node_pools.tf        # the two node pools
+  outputs.tf
+  envs/lab.tfvars      # the values of the lab environment
+```
+
+## 1. The Cluster We Are Creating
+
+```mermaid
+flowchart TB
+  you([You / pipeline]) -- "DNS endpoint<br/>+ Google identity (IAM)" --> cp[Control plane<br/>managed by Google]
+  subgraph subnet["Subnet gitops-hub"]
+    subgraph system["Pool system: 1 on-demand node"]
+      argo[Argo CD, later]
+    end
+    subgraph apps["Pool apps: 1 to 3 Spot nodes"]
+      work[Add-ons and apps]
+    end
+  end
+  cp --- system
+  cp --- apps
+  subnet -- outbound only --> nat[Cloud NAT] --> internet((Internet))
+```
+
+| Choice | What we use | Why |
+|---|---|---|
+| Mode | GKE **Standard** | We manage the node pools ourselves, which is how we learn what runs where. (Autopilot hides the nodes.) |
+| Location | **Zonal** (`us-central1-a`) | The GKE free tier credit covers the cluster fee of **one** zonal cluster per billing account. We only pay for the nodes. |
+| Nodes | **Private** (no public IP) | Nothing on the internet can reach them. They go out through the Cloud NAT from Lesson 2. |
+| Control plane access | **DNS endpoint**, IP endpoint off | `kubectl` and the pipeline reach the cluster with a Google identity. No bastion, no VPN, no IP allowlist. |
+| Pod identity | **Workload Identity** | Pods can call Google APIs without key files, the same idea as the GitHub login from Lesson 1. |
+| Networking | **Dataplane V2** | eBPF-based networking with NetworkPolicy built in. |
+| Exposing apps | **Gateway API** on | The modern way to expose services. We use it later for Argo CD. |
+| Upgrades | release channel **REGULAR** | Google upgrades the cluster automatically to tested versions. |
+
+**Two node pools:**
+
+| Pool | Nodes | Why |
+|---|---|---|
+| `system` | 1 × `e2-standard-2`, **on-demand** | Argo CD will run here, on a node that never disappears. |
+| `apps` | 1 to 3 × `e2-standard-4`, **Spot** | Spot VMs cost much less, but Google can reclaim them at any time. Good for workloads that can restart. |
+
+## 2. The Terraform Files
+
+**Finding the network.** `gke/` doesn't read the state of `network/`. It looks the network up by name instead, so the two folders stay independent:
+
+```hcl
+# gke/data.tf
+data "google_compute_network" "this" {
+  name = "${var.name_prefix}-vpc"
+}
+
+data "google_compute_subnetwork" "hub" {
+  name   = "${var.name_prefix}-hub"
+  region = var.region
+}
+```
+
+**The identity of the nodes.** Without a dedicated service account, GKE nodes use the Compute Engine default service account, which is **Editor** on the whole project. Ours only gets what nodes need:
+
+```hcl
+# gke/service_account.tf
+resource "google_service_account" "nodes" {
+  account_id   = "${var.name_prefix}-hub-nodes"
+  display_name = "GKE nodes of ${var.name_prefix}-hub"
+}
+
+resource "google_project_iam_member" "nodes" {
+  for_each = toset([
+    "roles/container.defaultNodeServiceAccount",
+    "roles/artifactregistry.reader",
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = google_service_account.nodes.member
+}
+```
+
+These are exactly the two roles the `terraform` service account is allowed to grant (the IAM condition from Lesson 1, step 5).
+
+**The cluster** (the most important parts):
+
+```hcl
+# gke/cluster.tf (excerpt)
+resource "google_container_cluster" "hub" {
+  name     = "${var.name_prefix}-hub"
+  location = var.zone
+
+  deletion_protection = false
+
+  network         = data.google_compute_network.this.self_link
+  subnetwork      = data.google_compute_subnetwork.hub.self_link
+  networking_mode = "VPC_NATIVE"
+
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "hub-pods"
+    services_secondary_range_name = "hub-services"
+  }
+
+  datapath_provider = "ADVANCED_DATAPATH"
+
+  private_cluster_config {
+    enable_private_nodes = true
+  }
+
+  control_plane_endpoints_config {
+    dns_endpoint_config {
+      allow_external_traffic = true
+    }
+    ip_endpoints_config {
+      enabled = false
+    }
+  }
+
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  gateway_api_config {
+    channel = "CHANNEL_STANDARD"
+  }
+  ...
+}
+```
+
+What each block does:
+
+- **No default node pool.** `initial_node_count` and `node_config` are left out on purpose, so GKE doesn't create a default pool. Our pools are separate resources, which can be changed without recreating the cluster.
+- **`deletion_protection = false`**: this is a lab, destroyed and recreated often. In production you would leave it `true`.
+- **`ip_allocation_policy`**: uses the two secondary ranges from Lesson 2 **by name** (`hub-pods`, `hub-services`).
+- **`control_plane_endpoints_config`**: turns on the DNS endpoint and turns off the IP endpoint. Every request to the API server is authorised by IAM.
+
+The rest of the file:
+
+- **`logging_config` / `monitoring_config`** send only system logs and metrics, to keep costs low. Managed Prometheus is off, because we install our own monitoring later.
+- **`resource_labels`** show up in the billing report.
+
+**The node pools.** Both have the same hardening. The differences are the machine, Spot, and autoscaling:
+
+```hcl
+# gke/node_pools.tf (excerpt: the apps pool)
+resource "google_container_node_pool" "apps" {
+  name     = "apps"
+  location = var.zone
+  cluster  = google_container_cluster.hub.name
+
+  initial_node_count = var.apps_min_nodes
+
+  autoscaling {
+    min_node_count = var.apps_min_nodes
+    max_node_count = var.apps_max_nodes
+  }
+
+  network_config {
+    enable_private_nodes = true
+  }
+
+  node_config {
+    machine_type    = var.apps_machine_type
+    spot            = true
+    service_account = google_service_account.nodes.email
+    ...
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [initial_node_count]
+  }
+}
+```
+
+- **`spot = true`**: cheap VMs that Google can reclaim.
+- **`autoscaling`**: GKE adds nodes (up to 3) when Pods don't fit, and removes them when they are idle.
+- **`network_config.enable_private_nodes`**: repeated on each pool, so the nodes are private even if the cluster-level setting doesn't reach the pool.
+- **`GKE_METADATA`**: Pods see only their own Workload Identity, never the node's service account.
+- **`shielded_instance_config`**: Secure Boot checks that the node boots only signed software.
+- **`ignore_changes = [initial_node_count]`**: the autoscaler changes the node count, and Terraform must not fight it.
+
+The `system` pool is the same without Spot and without autoscaling (`node_count = 1`).
+
+**The values of the lab:**
+
+```hcl
+# gke/envs/lab.tfvars
+region      = "us-central1"
+zone        = "us-central1-a"
+name_prefix = "gitops"
+
+system_machine_type = "e2-standard-2"
+
+apps_machine_type = "e2-standard-4"
+apps_min_nodes    = 1
+apps_max_nodes    = 3
+```
+
+`name_prefix` must be the same as in `network/envs/lab.tfvars`, because that is how `gke/` finds the network.
+
+## 3. A Pipeline That Grows with the Repository
+
+In Lesson 2 the workflow handled a single folder. With a second folder, and more to come (Argo CD is next), a pipeline that runs everything on every push doesn't scale:
+
+- every push plans and applies every folder, even the ones that didn't change
+- the plan of `gke/` would be computed **before** `network/` is applied, so it could be based on an old network
+- one failure mixes the logs of every folder, and you can't re-run just one part
+
+So we restructure the pipeline the way companies do, using only GitHub Actions:
+
+```txt
+# linuxtips-gitops-gke
+.github/workflows/
+  _terraform.yaml      # reusable: plan + apply of ONE folder
+  terraform.yaml       # orchestrates: checks, detect changes, network → gke
+  destroy.yaml         # calls _terraform.yaml with destroy: true
+.tflint.hcl            # lint rules (Terraform + Google)
+.trivyignore.yaml      # accepted security findings, each one explained
+```
+
+```mermaid
+flowchart LR
+  push[push to main] --> checks["checks<br/>fmt, validate, tflint, trivy"]
+  push --> changes["changes<br/>which folders changed?"]
+  checks --> net
+  changes -- "network/ changed" --> net["network<br/>plan → apply"]
+  changes -- "gke/ changed" --> gke["gke<br/>plan → apply"]
+  net --> gke
+```
+
+**The reusable workflow.** `_terraform.yaml` is triggered by `workflow_call`: it is never started by a push, only called by other workflows, with the folder as an input. The `_` prefix is just a convention that marks it as internal.
+
+```yaml
+# .github/workflows/_terraform.yaml (excerpt)
+on:
+  workflow_call:
+    inputs:
+      dir:
+        description: Terraform folder (network, gke...)
+        type: string
+        required: true
+      env:
+        description: Environment (GitHub Environment, envs/<env>.tfvars and state prefix)
+        type: string
+        default: lab
+      destroy:
+        description: Plan and apply a destroy instead of a normal change
+        type: boolean
+        default: false
+```
+
+Inside, it has the same `plan` and `apply` jobs from Lesson 2, now using `inputs.dir` and `inputs.env`. The state prefix stays `<env>/<dir>`. With `destroy: true`, it runs `plan -destroy` and `apply -destroy` instead.
+
+**The checks job.** It runs first, **without** cloud credentials and **without** approval. A formatting error, an invalid attribute or a security problem stops the run before you are asked to approve anything:
+
+| Step | Catches |
+|---|---|
+| `terraform fmt -check` | unformatted code |
+| `terraform validate` | invalid syntax, unknown attributes, wrong types |
+| `tflint` (Google ruleset) | invalid machine types and regions, unused variables, deprecated syntax |
+| `trivy config` | security misconfigurations (public buckets, missing encryption, open firewalls...) |
+
+Trivy found one item that doesn't apply to us. Instead of turning the check off, we accept it explicitly, with the reason:
+
+```yaml
+# .trivyignore.yaml
+misconfigurations:
+  - id: GCP-0061
+    paths:
+      - "gke/cluster.tf"
+    statement: >-
+      Master authorized networks only filter the IP-based control-plane endpoint, which is
+      disabled. The cluster is reached only through its DNS endpoint, authorised by IAM.
+```
+
+> **Note:** Trivy is downloaded from its release page and checked against a fixed SHA-256 checksum (`TRIVY_SHA256`). If the file were ever replaced by a malicious one, the checksum wouldn't match and the step would fail.
+
+**Detecting changes.** The `changes` job compares the pushed commits (`git diff` between the previous and the new commit) and outputs `true` or `false` for each folder:
+
+```yaml
+# .github/workflows/terraform.yaml (excerpt)
+          for dir in network gke; do
+            if [ "$all" = "true" ] || grep -q "^$dir/" <<<"$changed"; then value=true; else value=false; fi
+            echo "$dir=$value" >>"$GITHUB_OUTPUT"
+          done
+```
+
+Every folder runs (`all=true`) when:
+- the run was started by hand
+- it is the first push of a branch
+- a workflow or a lint/security config changed, since those affect everything
+
+**Calling the reusable workflow.** Each folder is one small job:
+
+```yaml
+# .github/workflows/terraform.yaml (excerpt)
+  network:
+    needs: [checks, changes]
+    if: needs.changes.outputs.network == 'true'
+    uses: ./.github/workflows/_terraform.yaml
+    with:
+      dir: network
+    permissions:
+      contents: read
+      id-token: write
+
+  gke:
+    needs: [checks, changes, network]
+    if: ${{ !failure() && !cancelled() && needs.changes.outputs.gke == 'true' }}
+    uses: ./.github/workflows/_terraform.yaml
+    with:
+      dir: gke
+    permissions:
+      contents: read
+      id-token: write
+```
+
+- **`needs: [..., network]`** makes `gke` wait for `network`. Its plan is computed only **after** the network is applied, so it never sees an old network.
+- **`!failure() && !cancelled()`**: by default, a job is skipped when a job it needs was skipped. This condition says "run if nothing failed", so `gke` still runs when only `gke/` changed and `network` was skipped. If `network` fails, `gke` doesn't run.
+- **`permissions`**: a called workflow can never have more permissions than the job that calls it, so `id-token: write` must be granted here too.
+- Adding the next folder (Argo CD) is one more job like these.
+
+> **Note:** Approvals are now per folder: `plan` and `apply` of each one. A push that changes one folder asks for two approvals. When two folders are waiting together, you can approve both in the same **Review deployments** dialog.
+
+## 4. Run It
+
+```bash
+git add .github .tflint.hcl .trivyignore.yaml gke
+git commit -m "feat: add gke cluster and reusable terraform pipeline"
+git push
+```
+
+Since this push changes the workflows, **every folder runs**:
+
+1. `checks` and `changes` run on their own (no approval). Wait for `checks` to pass.
+2. **network / plan** waits for approval. Approve it: the plan says `No changes`. Approve **network / apply** as well (it changes nothing).
+3. **gke / plan** waits for approval. Approve it and read the summary. Six resources to create:
+
+   ```txt
+     # google_container_cluster.hub will be created
+     # google_container_node_pool.apps will be created
+     # google_container_node_pool.system will be created
+     # google_project_iam_member.nodes["roles/artifactregistry.reader"] will be created
+     # google_project_iam_member.nodes["roles/container.defaultNodeServiceAccount"] will be created
+     # google_service_account.nodes will be created
+   ...
+   Plan: 6 to add, 0 to change, 0 to destroy.
+   ```
+
+4. Approve **gke / apply**. Creating a GKE cluster takes about **10 minutes**: the control plane first, then the node pools. It ends with:
+
+   ```txt
+   Apply complete! Resources: 6 added, 0 changed, 0 destroyed.
+
+   Outputs:
+
+   cluster_location = "us-central1-a"
+   cluster_name = "gitops-hub"
+   get_credentials = "gcloud container clusters get-credentials gitops-hub --location us-central1-a --project your-project-id --dns-endpoint"
+   ```
+
+From now on, a push that changes only `gke/` runs only the `gke` jobs.
+
+## 5. Connect with kubectl
+
+The Cloud Shell already has `kubectl` and the GKE auth plugin. Copy the `get_credentials` command from the output:
+
+```bash
+gcloud container clusters get-credentials gitops-hub \
+  --location us-central1-a --project "$PROJECT_ID" --dns-endpoint
+```
+
+`--dns-endpoint` connects through the DNS endpoint, with your Google identity. You can do it from anywhere: the Cloud Shell, your laptop or the pipeline.
+
+List the nodes, showing which pool each one belongs to and whether it is Spot:
+
+```bash
+kubectl get nodes -L node-pool,cloud.google.com/gke-spot
+```
+
+```txt
+NAME                                     STATUS   ROLES    AGE   VERSION   NODE-POOL   GKE-SPOT
+gke-gitops-hub-apps-1a2b3c4d-x7k2        Ready    <none>   4m    v1.xx.x   apps        true
+gke-gitops-hub-system-5e6f7a8b-p9qz      Ready    <none>   5m    v1.xx.x   system
+```
+
+One `system` node and one Spot `apps` node: the cluster is ready.
+
+To confirm the nodes have no public IP (the `EXTERNAL-IP` column is `<none>`):
+
+```bash
+kubectl get nodes -o wide
+```
+
+## 6. Destroy and Recreate the Cluster
+
+The cluster fee is covered by the free tier credit, but **the nodes cost money while they run**, even if nothing is deployed. As a rough reference, in `us-central1` an on-demand `e2-standard-2` costs around US$ 49/month and a Spot `e2-standard-4` around US$ 60/month. Check current prices in the [pricing calculator](https://cloud.google.com/products/calculator). Left running all the time, the lab costs a few dollars a day.
+
+So when you finish studying, destroy the cluster:
+
+1. **Actions → destroy-gke → Run workflow**.
+2. Approve **gke / plan** and check the summary: `Plan: 0 to add, 0 to change, 6 to destroy.`
+3. Approve **gke / apply**.
+
+The workflow destroys **only `gke/`**. The network stays: it costs almost nothing idle, and keeping it makes the next start faster. It is the same reusable workflow, called with `destroy: true`:
+
+```yaml
+# .github/workflows/destroy.yaml (excerpt)
+jobs:
+  gke:
+    uses: ./.github/workflows/_terraform.yaml
+    with:
+      dir: gke
+      destroy: true
+    permissions:
+      contents: read
+      id-token: write
+```
+
+To bring the cluster back: **Actions → terraform → Run workflow**. Since everything is code, the new cluster is identical to the old one.
+
+> **Note:** `destroy.yaml` uses the same `concurrency` group as `terraform.yaml`, so a destroy and an apply never run at the same time.
+
+## 7. Troubleshooting the Cluster
+
+| Error | Likely cause | Fix |
+|---|---|---|
+| `Error reading Network` / `subnetwork not found` | `network/` was not applied, or `name_prefix` differs between the two `lab.tfvars` | apply `network/` first; use the same `name_prefix` |
+| `Permission 'iam.serviceAccounts.actAs' denied` | the `terraform` service account can't attach the node service account | Lesson 1, step 5: `roles/iam.serviceAccountUser` |
+| `Policy update access denied` / `setIamPolicy` on the project | the IAM condition doesn't allow one of the node roles | Lesson 1, step 5: check the condition lists both roles |
+| `Kubernetes Engine API has not been used` | the `container` API is not enabled | Lesson 1, step 2 |
+| `ZONE_RESOURCE_POOL_EXHAUSTED` or Spot nodes not starting | the zone has no free capacity for that machine type right now | wait and re-run, or try another zone in `lab.tfvars` |
+| `Quota 'CPUS' exceeded` | new projects have low CPU quotas | request more quota (IAM & Admin → Quotas) or use smaller machines |
+| `checks` fails in `terraform fmt` | the code isn't formatted | run `terraform fmt -recursive` locally and push |
+| `checks` fails in `trivy` | a new security finding | fix the code, or (only if it really doesn't apply) add it to `.trivyignore.yaml` with the reason |
+| `kubectl`: `connection refused` / `Unable to connect` | `get-credentials` was run without `--dns-endpoint` | run it again with `--dns-endpoint` |
+
+## Key Takeaways
+
+- The hub is a zonal GKE Standard cluster: the free tier covers its fee, and we pay only for the nodes.
+- Nodes are private, and the control plane is reached only through its DNS endpoint with IAM. No bastion and no IP allowlists.
+- The nodes run with a dedicated, minimal service account, never the Editor-level default one.
+- On-demand `system` pool for what must stay up, Spot `apps` pool for everything else.
+- `gke/` finds the network by name, so each folder keeps its own state.
+- The pipeline runs static checks first (no credentials, no approval), then only the folders that changed, in order, through one reusable workflow.
+- The same reusable workflow, with `destroy: true`, powers a manual button that destroys the cluster to save money.

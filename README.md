@@ -26,6 +26,7 @@ Modules are added here as they are written.
 
 - Preparing the GCP project with `gcloud`: APIs, the Terraform state bucket, Workload Identity Federation and a least-privilege service account
 - Creating the network: VPC, subnet with Pod and Service ranges, Cloud NAT, applied by a GitHub Actions pipeline with keyless login and approval gates
+- Creating the GKE cluster: zonal Standard cluster with private nodes, DNS endpoint, Workload Identity, an on-demand system pool and a Spot apps pool; a reusable pipeline with static checks, change detection and a manual destroy workflow
 
 ## License
 
