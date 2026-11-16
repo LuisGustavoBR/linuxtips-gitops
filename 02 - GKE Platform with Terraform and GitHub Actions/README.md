@@ -152,7 +152,7 @@ gcloud iam workload-identity-pools providers create-oidc github-actions \
 What the options mean:
 
 - **`--issuer-uri`**: trust tokens signed by GitHub Actions.
-- **`--attribute-mapping`**: which fields of the GitHub token Google keeps. The important one is `google.subject`, which for a job in an environment looks like `repo:LuisGustavoBR/linuxtips-gitops-gke:environment:lab`.
+- **`--attribute-mapping`**: which fields of the GitHub token Google keeps. The important one is `google.subject`, which identifies exactly which job is calling. For a job in an environment it looks like `repo:LuisGustavoBR@60719801/linuxtips-gitops-gke@1459115013:environment:lab`: owner and repository, each with its numeric ID, plus the environment.
 - **`--attribute-condition`**: the security gate. **Only tokens from this repository are accepted at all.** Without it, any GitHub repository could try to log in to your pool.
 
 > **Note:** A deleted pool stays in a "deleted" state for 30 days, and its name can't be reused during that time. If you need to start over, undelete it (`gcloud iam workload-identity-pools undelete github --location=global`) instead of creating a new one with the same name.
@@ -230,8 +230,12 @@ The last link: tokens from GitHub may **impersonate** (act as) the `terraform` s
 ```bash
 gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
   --role="roles/iam.workloadIdentityUser" \
-  --member="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github/subject/repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:lab"
+  --member="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github/subject/repo:${GITHUB_OWNER}@${GITHUB_OWNER_ID}/${GITHUB_REPO}@${GITHUB_REPO_ID}:environment:lab"
 ```
+
+The member must be **exactly** the subject that GitHub puts in the job's token, character by character. GitHub writes it with the immutable IDs: `repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env>`. That is better for us: renaming the user or the repository doesn't break the link, because the IDs never change.
+
+> **Note:** Some repositories still receive the older format without IDs (`repo:<owner>/<repo>:environment:<env>`). If the pipeline later fails with `getAccessToken denied`, check which format your token uses (Lesson 2, section 6 shows how) and create the member with that exact text.
 
 Why tie it to an environment? In GitHub, an **environment** can require a **reviewer**. So a job only gets these credentials after you approve the run. A pull request alone, or a commit pushed by someone else, can't change your infrastructure.
 
@@ -641,11 +645,52 @@ Login problems break in the **"Log in to Google Cloud"** step or in `terraform i
 | Error | Likely cause | Fix |
 |---|---|---|
 | `The given credential is rejected by the attribute condition` | the repository or owner ID in the provider condition is wrong | Lesson 1, steps 1 and 4: check `GITHUB_REPO_ID` / `GITHUB_OWNER_ID` |
-| `Permission 'iam.serviceAccounts.getAccessToken' denied` | the job is not allowed to use the service account (wrong repo name or environment in the `principal://` member) | Lesson 1, step 6 |
+| `Permission 'iam.serviceAccounts.getAccessToken' denied` (usually in `terraform init`) | the `principal://` member of the service account doesn't match the token's subject exactly (format, repo name or environment), or the `GCP_SERVICE_ACCOUNT` variable points to a service account that doesn't exist | see [the subject GitHub sends](#seeing-the-subject-github-sends) below, then fix Lesson 1, step 6 |
 | `Unable to retrieve ... id-token` / `ACTIONS_ID_TOKEN_REQUEST_URL` missing | the job lacks `id-token: write` | check the job's `permissions` |
 | `storage.objects.list access ... denied` in `terraform init` | the service account can't use the bucket | Lesson 1, step 5 (bucket binding) |
 | `Error: No value for required variable "project_id"` | the `GCP_PROJECT_ID` GitHub variable is missing or misspelled | Lesson 1, step 7 |
 | Job stuck in **Waiting** | it is waiting for your approval | **Review deployments** |
+
+> **Note:** The login step only exchanges the GitHub token for a Google *federated* token, and it succeeds even if the service account link is wrong. The service account is impersonated the first time something uses it, which is `terraform init`. That's why a wrong link shows up there.
+
+### Seeing the Subject GitHub Sends
+
+If you get `getAccessToken denied` and the member in Lesson 1, step 6 looks right, compare it with what GitHub really sends. Add this temporary step to the `plan` job, right before the login step:
+
+```yaml
+# .github/workflows/terraform.yaml (temporary debug step)
+      - name: Debug OIDC claims (temporary)
+        env:
+          WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          echo "GCP_WIF_PROVIDER    = [${WIF_PROVIDER}]"
+          echo "GCP_SERVICE_ACCOUNT = [${SERVICE_ACCOUNT}]"
+          TOKEN=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=debug" | jq -r .value)
+          python3 -c '
+          import sys, json, base64
+          p = sys.argv[1].split(".")[1]
+          p += "=" * (-len(p) % 4)
+          c = json.loads(base64.urlsafe_b64decode(p))
+          keys = ["sub", "environment", "repository", "repository_id", "repository_owner_id", "ref"]
+          print(json.dumps({k: c.get(k) for k in keys}, indent=2))
+          ' "$TOKEN"
+```
+
+It prints the two variables between brackets (so a stray space shows up) and the claims of the token. It never prints the token itself, and the token it requests has the audience `debug`, so it couldn't log in to Google Cloud anyway. Example output:
+
+```txt
+GCP_WIF_PROVIDER    = [projects/302737505132/locations/global/workloadIdentityPools/github/providers/github-actions]
+GCP_SERVICE_ACCOUNT = [terraform@your-project-id.iam.gserviceaccount.com]
+{
+  "sub": "repo:LuisGustavoBR@60719801/linuxtips-gitops-gke@1459115013:environment:lab",
+  "environment": "lab",
+  ...
+}
+```
+
+The member of the service account must end with exactly the `sub` value. If it doesn't, add a member with the right text (Lesson 1, step 6), remove the wrong one with `remove-iam-policy-binding`, wait a minute and re-run. Then delete the debug step.
 
 Problems with the network itself show up later, in `plan` or `apply`:
 
