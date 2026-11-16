@@ -8,7 +8,7 @@ In this module we will:
 
 - install Argo CD with Terraform, through the same pipeline that created the cluster
 - open the Argo CD UI and log in
-- create our first Application (in the next lessons)
+- create our first Application, first in the UI and then the GitOps way
 
 ## Table of Contents
 
@@ -19,6 +19,14 @@ In this module we will:
   - [4. Run It](#4-run-it)
   - [5. Open the Argo CD UI](#5-open-the-argo-cd-ui)
   - [6. Troubleshooting](#6-troubleshooting)
+- [Lesson 2: Your First Application in the UI](#lesson-2-your-first-application-in-the-ui)
+  - [1. A Quick Tour of the UI](#1-a-quick-tour-of-the-ui)
+  - [2. The Application Manifests](#2-the-application-manifests)
+  - [3. Create the Application in the UI](#3-create-the-application-in-the-ui)
+  - [4. OutOfSync, Then Sync](#4-outofsync-then-sync)
+  - [5. See podinfo Running](#5-see-podinfo-running)
+  - [6. What the UI Created](#6-what-the-ui-created)
+  - [7. Delete It](#7-delete-it)
 
 ---
 
@@ -276,3 +284,208 @@ The Applications page is empty for now: there is nothing in Git for Argo CD to d
 - The chart version is pinned per environment, so an upgrade is a reviewed commit.
 - Every Argo CD component runs on the on-demand `system` pool.
 - The initial admin password is in the `argocd-initial-admin-secret` Secret, and the UI is reachable with `kubectl port-forward` and the Cloud Shell Web Preview.
+
+---
+
+# Lesson 2: Your First Application in the UI
+
+Time to deploy something. We start with the simplest possible application, and we create it **in the Argo CD UI**: the form shows every field of an Application, which is the best way to learn them.
+
+At the end we delete it. An Application created by clicking is not in Git, which goes against everything from Module 1. In the next lesson we create it the right way.
+
+## 1. A Quick Tour of the UI
+
+Open the UI (Lesson 1, section 5) and look around:
+
+| Page | What it is for |
+|---|---|
+| **Applications** | the list of Applications. Each card shows the sync status (*Synced* / *OutOfSync*) and the health (*Healthy*, *Progressing*, *Degraded*...) from Module 1 |
+| **Settings → Repositories** | Git and Helm repositories that need credentials. Our repositories are public, so nothing is needed here |
+| **Settings → Clusters** | clusters Argo CD can deploy to. There is one: `in-cluster`, the cluster Argo CD itself runs in (`https://kubernetes.default.svc`) |
+| **Settings → Projects** | AppProjects group Applications and limit what they can do. For now there is only `default`, which allows everything |
+| **User Info** | who you are logged in as. You can switch to a dark theme here |
+
+On every Application there are two buttons we use all the time:
+
+| Button | What it does |
+|---|---|
+| **Refresh** | compares Git with the cluster now, instead of waiting for the next cycle (the *refresh* step from Module 1) |
+| **Sync** | applies what is in Git to the cluster (the *sync* step) |
+
+## 2. The Application Manifests
+
+What we deploy lives in the **[linuxtips-gitops-argocd](https://github.com/LuisGustavoBR/linuxtips-gitops-argocd)** repository, the one Argo CD watches:
+
+```txt
+# linuxtips-gitops-argocd
+apps/
+  podinfo/
+    deployment.yaml
+    service.yaml
+```
+
+Two plain Kubernetes YAML files: no Helm, no Kustomize. The app is [podinfo](https://github.com/stefanprodan/podinfo), a small web app made for Kubernetes demos.
+
+```yaml
+# apps/podinfo/deployment.yaml (excerpt)
+spec:
+  replicas: 2
+  ...
+      containers:
+        - name: podinfo
+          image: ghcr.io/stefanprodan/podinfo:6.17.0
+          ports:
+            - name: http
+              containerPort: 9898
+          env:
+            - name: PODINFO_UI_MESSAGE
+              value: "Hello from Argo CD"
+```
+
+- Two replicas of the podinfo image, with a **fixed version** (`6.17.0`), never `latest`.
+- `PODINFO_UI_MESSAGE` is shown on the podinfo web page. Later we change it in Git and watch the new value reach the cluster.
+- The full file also has health probes (`/readyz`, `/healthz`) and resource requests.
+
+```yaml
+# apps/podinfo/service.yaml (excerpt)
+spec:
+  selector:
+    app: podinfo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+A `ClusterIP` Service: port 80 inside the cluster, sent to port 9898 of the Pods.
+
+> **Note:** The manifests have **no namespace**. The namespace is decided by the Application (its destination), so the same files can be deployed anywhere.
+
+## 3. Create the Application in the UI
+
+Click **+ New App** and fill in:
+
+| Section | Field | Value | Why |
+|---|---|---|---|
+| General | Application Name | `podinfo-ui` | any name |
+| General | Project Name | `default` | projects come later |
+| General | Sync Policy | `Manual` | so we can see the two steps of the loop separately |
+| General | Sync Options | ✅ **Auto-Create Namespace** | our manifests don't create the namespace |
+| Source | Repository URL | `https://github.com/LuisGustavoBR/linuxtips-gitops-argocd.git` | the repository Argo CD watches |
+| Source | Revision | `HEAD` | the latest commit of the default branch |
+| Source | Path | `apps/podinfo` | the folder with the manifests |
+| Destination | Cluster URL | `https://kubernetes.default.svc` | the cluster Argo CD runs in |
+| Destination | Namespace | `podinfo-ui` | where the app goes |
+
+After you paste the repository URL, the **Revision** and **Path** fields start suggesting values. That is the **repo-server** (Module 1) already cloning the repository and finding the folders with manifests.
+
+Below, the form shows a **Directory** section, because `apps/podinfo` contains plain YAML files. Argo CD detects the type of source by itself:
+- plain YAML (a directory)
+- Kustomize (a `kustomization.yaml`)
+- Helm (a `Chart.yaml`)
+
+Leave it as it is and click **Create**.
+
+## 4. OutOfSync, Then Sync
+
+The new Application appears as **OutOfSync** and **Missing**:
+
+- **OutOfSync**: the *refresh* step ran. Argo CD read Git and knows the cluster doesn't match it.
+- **Missing**: the resources don't exist in the cluster yet.
+
+Nothing was deployed, because the sync policy is manual. Argo CD did step 1 of the loop and is waiting for us to do step 2.
+
+Open the Application: the tree shows the Deployment and the Service, both yellow (out of sync). Click **Sync** → **Synchronize**.
+
+Argo CD creates the namespace and the resources. After a few seconds, the Application turns **Synced** and **Healthy**, and the tree grows: Deployment → ReplicaSet → Pods. The ReplicaSet and the Pods are not in Git; Kubernetes created them from the Deployment, and Argo CD shows them so you can see the whole picture.
+
+## 5. See podinfo Running
+
+In the Cloud Shell:
+
+```bash
+kubectl get all -n podinfo-ui
+```
+
+```txt
+NAME                           READY   STATUS    RESTARTS   AGE
+pod/podinfo-6d9c8b7f5d-8kx2m   1/1     Running   0          40s
+pod/podinfo-6d9c8b7f5d-tq7wn   1/1     Running   0          40s
+
+NAME              TYPE        CLUSTER-IP     PORT(S)   AGE
+service/podinfo   ClusterIP   10.30.21.147   80/TCP    40s
+
+NAME                      READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/podinfo   2/2     2            2           40s
+...
+```
+
+To open podinfo in the browser, open a **second Cloud Shell tab** (the `+` button), because the first one is busy with the Argo CD port-forward, and run:
+
+```bash
+kubectl port-forward -n podinfo-ui svc/podinfo 8081:80
+```
+
+Then **Web Preview → Change port → 8081**. The podinfo page shows the message **"Hello from Argo CD"** and the name of the Pod that answered.
+
+## 6. What the UI Created
+
+The form didn't do anything magic: it created an **Application** resource in the cluster. You can see it under **App Details → Manifest**, or with `kubectl`:
+
+```bash
+kubectl get applications -n argocd
+kubectl get application podinfo-ui -n argocd -o yaml
+```
+
+Without the fields Kubernetes and Argo CD add by themselves (`status`, `metadata.uid`, `creationTimestamp`...), this is what is left:
+
+```yaml
+# kubectl get application podinfo-ui -n argocd -o yaml (cleaned up)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: podinfo-ui
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: podinfo-ui
+  source:
+    repoURL: https://github.com/LuisGustavoBR/linuxtips-gitops-argocd.git
+    targetRevision: HEAD
+    path: apps/podinfo
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+```
+
+Every field of the form is here, and it is the **where / what / how** from Module 1:
+
+- **`destination`** is *where*: the cluster Argo CD runs in, namespace `podinfo-ui`.
+- **`source`** is *what*: this repository, at `HEAD`, folder `apps/podinfo`.
+- **`syncPolicy`** is *how*: manual (there is no `automated` block), creating the namespace.
+
+Note that the Application itself lives in the `argocd` namespace, where Argo CD runs, while the app goes to `podinfo-ui`.
+
+## 7. Delete It
+
+This Application exists only in the cluster. Nobody reviewed it, there is no history of it, and if the cluster were recreated tonight it would be gone. So we delete it:
+
+1. Stop the podinfo port-forward (`Ctrl+C` in the second tab).
+2. In the UI, open `podinfo-ui` → **Delete**.
+3. Type the name to confirm, and keep the propagation policy **Foreground**: Argo CD deletes the app's resources (Deployment, Service...) before the Application.
+
+```bash
+kubectl get all -n podinfo-ui   # No resources found
+```
+
+The namespace `podinfo-ui` stays, because Argo CD created it as a side effect of `CreateNamespace` and doesn't track it as part of the app. Remove it with `kubectl delete namespace podinfo-ui`, or leave it: it costs nothing.
+
+## Key Takeaways
+
+- The **New App** form is just a friendly way to write an `Application` resource.
+- With a manual sync policy, Argo CD shows *OutOfSync* and waits for you to press **Sync**.
+- The repo-server clones the repository and detects the type of source by itself: plain YAML, Kustomize or Helm.
+- Manifests without a namespace can be deployed anywhere; the Application decides where.
+- Applications created by clicking are not in Git. Use the UI to learn and to look, not to change things.

@@ -31,6 +31,7 @@ Modules are added here as they are written.
 ### [Module 03 - Installing Argo CD and the First Application](./03%20-%20Installing%20Argo%20CD%20and%20the%20First%20Application/README.md)
 
 - Installing Argo CD with Terraform: Helm release through the DNS endpoint, pinned chart version, values file, components on the system pool, UI through port-forward
+- The first Application in the UI: a tour of the UI, every field of an Application, manual sync, and the YAML the UI creates
 
 ## License
 
