@@ -36,6 +36,13 @@ In this module we will:
   - [6. Drift: Changing the Cluster by Hand](#6-drift-changing-the-cluster-by-hand)
   - [7. Automated Sync and Self-Heal](#7-automated-sync-and-self-heal)
   - [8. Changing the App Through Git](#8-changing-the-app-through-git)
+- [Lesson 4: Where to Look When Something Goes Wrong](#lesson-4-where-to-look-when-something-goes-wrong)
+  - [1. Sync Status Is Not Health](#1-sync-status-is-not-health)
+  - [2. Problem 1: An Image That Doesn't Exist](#2-problem-1-an-image-that-doesnt-exist)
+  - [3. Problem 2: A Wrong Path in the Application](#3-problem-2-a-wrong-path-in-the-application)
+  - [4. The Logs: application-controller and repo-server](#4-the-logs-application-controller-and-repo-server)
+  - [5. Useful Tools](#5-useful-tools)
+- [Module Key Takeaways](#module-key-takeaways)
 
 ---
 
@@ -748,3 +755,184 @@ Look at the `podinfo` Application in the UI: **Last Sync** shows the commit that
 - Creating an Application is now a commit; nobody runs `kubectl apply` or clicks **New App**.
 - With a manual policy, Argo CD detects **drift** and waits; with `automated` + `selfHeal`, it fixes drift by itself; `prune` deletes what was removed from Git.
 - A change in Git reaches the cluster on its own, and Git history becomes the deployment history.
+
+---
+
+# Lesson 4: Where to Look When Something Goes Wrong
+
+A big part of daily work with Argo CD is troubleshooting. In this lesson we break podinfo on purpose, **through Git**, the way real problems arrive, and look at where each problem shows up.
+
+The two problems are different on purpose:
+
+| Problem | Argo CD can apply it? | What breaks |
+|---|---|---|
+| An image that doesn't exist | **yes**: the app is *Synced* | the app is not *Healthy* (Kubernetes can't run it) |
+| A wrong path in the Application | **no** | Argo CD can't even generate the manifests (*ComparisonError*) |
+
+## 1. Sync Status Is Not Health
+
+Module 1 introduced two separate statuses. Troubleshooting starts by knowing which one is wrong:
+
+| Status | Answers | Values |
+|---|---|---|
+| **Sync status** | does the cluster match Git? | Synced, OutOfSync, Unknown |
+| **Health** | is what's running working? | Healthy, Progressing, Degraded, Missing |
+
+An app can be **Synced** and **Degraded** at the same time: Argo CD applied exactly what Git says, but what Git says doesn't work.
+
+The fastest way to see both, besides the UI:
+
+```bash
+kubectl get applications -n argocd
+```
+
+```txt
+NAME      SYNC STATUS   HEALTH STATUS
+podinfo   Synced        Healthy
+root      Synced        Healthy
+```
+
+## 2. Problem 1: An Image That Doesn't Exist
+
+In `linuxtips-gitops-argocd`, change the podinfo image to a version that doesn't exist:
+
+```yaml
+# apps/podinfo/deployment.yaml (excerpt)
+          image: ghcr.io/stefanprodan/podinfo:9.9.9
+```
+
+```bash
+git commit -am "test: break podinfo image"
+git push
+```
+
+Click **Refresh** on `podinfo` (or wait a few minutes). Argo CD applies the change, since automated sync is on, and the result is:
+
+- **Sync status: Synced.** The Deployment in the cluster has exactly the image Git asked for.
+- **Health: Progressing**, and later **Degraded**. The new Pod never starts.
+
+**Where to look.** In the UI, open `podinfo` and follow the tree: Deployment → the **new** ReplicaSet → its Pod, with a broken heart icon. Click the Pod: the **Events** tab says why. In the terminal:
+
+```bash
+kubectl get pods -n podinfo
+```
+
+```txt
+NAME                       READY   STATUS             RESTARTS   AGE
+podinfo-6d9c8b7f5d-8kx2m   1/1     Running            0          1h
+podinfo-6d9c8b7f5d-tq7wn   1/1     Running            0          1h
+podinfo-7f8e9a6b4c-z2x9k   0/1     ImagePullBackOff   0          2m
+```
+
+```bash
+kubectl describe pod -n podinfo -l app=podinfo | grep -A3 "Failed"
+```
+
+The events say the image `ghcr.io/stefanprodan/podinfo:9.9.9` was **not found**.
+
+Notice that **podinfo is still answering**. Kubernetes replaces Pods gradually (*rolling update*): it starts a new Pod first and only removes an old one when the new one is ready. Since the new one never gets ready, the old ones keep running. The health stays *Progressing* until the Deployment's deadline (10 minutes by default), and then it turns *Degraded*.
+
+**The fix is in Git**, like the change was:
+
+```bash
+git revert HEAD --no-edit
+git push
+```
+
+After a refresh, the new ReplicaSet is scaled down and the app is **Healthy** again. `git revert` creates a new commit that undoes the previous one, so the history keeps both the mistake and the fix.
+
+## 3. Problem 2: A Wrong Path in the Application
+
+Now break the Application itself. In `applications/podinfo.yaml`, misspell the path:
+
+```yaml
+# applications/podinfo.yaml (excerpt)
+    path: apps/podinf
+```
+
+```bash
+git commit -am "test: break podinfo path"
+git push
+```
+
+`root` updates the `podinfo` Application (click **Refresh** on `root`, then on `podinfo`). This time:
+
+- **Sync status: Unknown.** Argo CD can't compare anything, because it couldn't build the desired state.
+- The app shows a **ComparisonError** condition, with a message saying the app path `apps/podinf` doesn't exist.
+
+Nothing in the cluster changed. Argo CD never applies something it couldn't render, so podinfo keeps running the last good version. **Prune doesn't delete anything** either: an empty or broken source is an error, not "Git wants zero resources".
+
+You can also read the condition without the UI:
+
+```bash
+kubectl describe application podinfo -n argocd
+```
+
+Look at the **Conditions** and **Events** sections near the end.
+
+Fix it the same way:
+
+```bash
+git revert HEAD --no-edit
+git push
+```
+
+## 4. The Logs: application-controller and repo-server
+
+The UI and `kubectl describe` show the result. The logs show the process, which helps when the message isn't clear. The two components from Module 1 split the work:
+
+| Component | Its logs explain |
+|---|---|
+| `argocd-application-controller` | the reconciliation: comparisons, syncs, health. Problems like *Degraded*, sync failures, permission errors when applying |
+| `argocd-repo-server` | talking to Git and rendering manifests. Problems like *ComparisonError*: path not found, invalid YAML, broken Kustomize or Helm |
+
+The application controller runs as a **StatefulSet**, the repo-server as a **Deployment**:
+
+```bash
+kubectl logs -n argocd statefulset/argocd-application-controller -f
+kubectl logs -n argocd deploy/argocd-repo-server -f
+```
+
+`-f` keeps following the log; `Ctrl+C` stops it. During a normal refresh, the application controller logs lines like:
+
+```txt
+level=info msg="Comparing app state (cluster: https://kubernetes.default.svc, namespace: podinfo)" application=argocd/podinfo
+level=info msg="Reconciliation completed" application=argocd/podinfo ...
+```
+
+Every line has `application=argocd/<name>`, so you can filter for one app:
+
+```bash
+kubectl logs -n argocd statefulset/argocd-application-controller --since=10m | grep "application=argocd/podinfo"
+```
+
+> **Note:** A good habit is to repeat Problem 2 while following the repo-server logs. You will see the same "app path does not exist" error there, with more context, which is where you would look first in a real incident.
+
+## 5. Useful Tools
+
+These are optional, but they make troubleshooting faster, especially once there is more than one cluster:
+
+| Tool | Why |
+|---|---|
+| [stern](https://github.com/stern/stern) | follows the logs of many Pods at once, matched by name: `stern -n argocd application-controller` |
+| [kube-ps1](https://github.com/jonmosco/kube-ps1) | shows the current cluster and namespace in the shell prompt, so you always know where your commands go |
+| [kubectx and kubens](https://github.com/ahmetb/kubectx) | switch cluster or namespace quickly. GKE context names are long (`gke_<project>_us-central1-a_gitops-hub`), so give them short names: `kubectx hub=gke_<project>_us-central1-a_gitops-hub` |
+| [k9s](https://k9scli.io/) | a terminal UI for the cluster, if you prefer it to plain `kubectl` |
+
+## Key Takeaways
+
+- Check **which status** is wrong first: sync status (does the cluster match Git?) or health (does it work?).
+- *Synced* + *Degraded* means Git asked for something that doesn't work. Look at the Pods and their events.
+- *Unknown* + *ComparisonError* means Argo CD couldn't render the source. Nothing is applied, and the last good version keeps running.
+- The application controller's logs explain reconciliation and health; the repo-server's logs explain rendering problems.
+- Problems that arrive through Git are fixed through Git: `git revert` keeps both the mistake and the fix in the history.
+
+---
+
+# Module Key Takeaways
+
+- Terraform installs Argo CD and a single **root** Application; everything else comes from Git.
+- The UI is the best way to learn the fields of an Application, but changes always go through Git.
+- An Application is *where* (`destination`), *what* (`source`) and *how* (`syncPolicy`).
+- With `automated` + `selfHeal` + `prune`, the cluster follows Git in both directions: drift is reverted and changes are applied.
+- When something breaks, check sync status and health separately, then the Pods' events, then the logs of the application controller and the repo-server.

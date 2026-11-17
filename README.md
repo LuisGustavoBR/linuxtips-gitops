@@ -33,6 +33,7 @@ Modules are added here as they are written.
 - Installing Argo CD with Terraform: Helm release through the DNS endpoint, pinned chart version, values file, components on the system pool, UI through port-forward
 - The first Application in the UI: a tour of the UI, every field of an Application, manual sync, and the YAML the UI creates
 - The GitOps way: a root Application created by Terraform, Applications as files in Git, drift, automated sync, self-heal and prune
+- Troubleshooting: sync status vs health, breaking the app through Git on purpose, application-controller and repo-server logs
 
 ## License
 
