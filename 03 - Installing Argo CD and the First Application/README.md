@@ -27,6 +27,15 @@ In this module we will:
   - [5. See podinfo Running](#5-see-podinfo-running)
   - [6. What the UI Created](#6-what-the-ui-created)
   - [7. Delete It](#7-delete-it)
+- [Lesson 3: The Same Application, the GitOps Way](#lesson-3-the-same-application-the-gitops-way)
+  - [1. How It Works](#1-how-it-works)
+  - [2. The Root Application (Terraform)](#2-the-root-application-terraform)
+  - [3. The podinfo Application (Git)](#3-the-podinfo-application-git)
+  - [4. Run It](#4-run-it-1)
+  - [5. Manual Sync](#5-manual-sync)
+  - [6. Drift: Changing the Cluster by Hand](#6-drift-changing-the-cluster-by-hand)
+  - [7. Automated Sync and Self-Heal](#7-automated-sync-and-self-heal)
+  - [8. Changing the App Through Git](#8-changing-the-app-through-git)
 
 ---
 
@@ -489,3 +498,253 @@ The namespace `podinfo-ui` stays, because Argo CD created it as a side effect of
 - The repo-server clones the repository and detects the type of source by itself: plain YAML, Kustomize or Helm.
 - Manifests without a namespace can be deployed anywhere; the Application decides where.
 - Applications created by clicking are not in Git. Use the UI to learn and to look, not to change things.
+
+---
+
+# Lesson 3: The Same Application, the GitOps Way
+
+In Lesson 2 the Application existed only in the cluster. Now it becomes **a file in Git**, and Git becomes the only way to change it.
+
+## 1. How It Works
+
+There is one problem to solve first: who creates the Applications that live in Git? Running `kubectl apply` by hand would be a manual step again.
+
+The answer is a single Application, called **root**, created by Terraform. Its only job is to watch the `applications/` folder of the gitops repository. Every Application file committed there is created by Argo CD:
+
+```mermaid
+flowchart LR
+  tf[Terraform<br/>linuxtips-gitops-gke] -- "creates once" --> root["Application<br/>root"]
+  root -- "watches applications/" --> repo[(linuxtips-gitops-argocd)]
+  repo -- "applications/podinfo.yaml" --> app["Application<br/>podinfo"]
+  app -- "watches apps/podinfo/" --> pods[podinfo<br/>in the cluster]
+```
+
+The `root` Application is the last thing created outside Git. From now on, adding an Application is just committing a file to `applications/`.
+
+> **Note:** An Application that creates other Applications is called the **app of apps** pattern, and the Argo CD documentation calls the top one the **root** Application. We use its simplest form here, and come back to it in more detail later.
+
+## 2. The Root Application (Terraform)
+
+It lives next to the Argo CD installation, in **[linuxtips-gitops-gke](https://github.com/LuisGustavoBR/linuxtips-gitops-gke)**:
+
+```hcl
+# argocd/root.tf (comments removed)
+resource "helm_release" "root" {
+  name      = "argocd-root"
+  namespace = helm_release.argocd.namespace
+
+  repository = "https://argoproj.github.io/argo-helm"
+  chart      = "argocd-apps"
+  version    = var.argocd_apps_chart_version
+
+  values = [yamlencode({
+    applications = {
+      root = {
+        namespace = helm_release.argocd.namespace
+        project   = "default"
+        source = {
+          repoURL        = var.gitops_repo_url
+          targetRevision = var.gitops_repo_revision
+          path           = "applications"
+        }
+        destination = {
+          server    = "https://kubernetes.default.svc"
+          namespace = helm_release.argocd.namespace
+        }
+        syncPolicy = {
+          automated = {
+            prune    = true
+            selfHeal = true
+          }
+        }
+      }
+    }
+  })]
+}
+```
+
+- **`argocd-apps`** is the official chart for creating Applications with Helm. Why not write the Application as a raw Kubernetes manifest in Terraform? Because the `Application` type only exists after Argo CD is installed, which happens in the same `apply`, and Terraform would fail at plan time.
+- **`source`**: the gitops repository, branch `main`, folder `applications`.
+- **`destination`**: the Application files it reads are created in the `argocd` namespace, where Applications must live.
+- **`automated` + `prune` + `selfHeal`**: a file added to `applications/` is created automatically, a file removed is deleted, and nobody can change these Applications by hand.
+
+The repository and branch come from the environment file:
+
+```hcl
+# argocd/envs/lab.tfvars (excerpt)
+argocd_apps_chart_version = "2.0.8"
+
+gitops_repo_url      = "https://github.com/LuisGustavoBR/linuxtips-gitops-argocd.git"
+gitops_repo_revision = "main"
+```
+
+## 3. The podinfo Application (Git)
+
+In **[linuxtips-gitops-argocd](https://github.com/LuisGustavoBR/linuxtips-gitops-argocd)**:
+
+```txt
+# linuxtips-gitops-argocd
+applications/
+  podinfo.yaml         # the Application (new)
+apps/
+  podinfo/             # what it deploys (Lesson 2)
+    deployment.yaml
+    service.yaml
+```
+
+```yaml
+# applications/podinfo.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: podinfo
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/LuisGustavoBR/linuxtips-gitops-argocd.git
+    targetRevision: main
+    path: apps/podinfo
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: podinfo
+  syncPolicy:
+    # automated:
+    #   prune: true
+    #   selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+It is the same Application from Lesson 2, with two differences:
+
+- **`targetRevision: main`** instead of `HEAD`. It names the branch explicitly, which is clearer when there are other branches.
+- **`automated` is commented out**: we start with a manual sync on purpose, to see drift first.
+
+## 4. Run It
+
+First the gitops repository, so the `applications/` folder exists when Argo CD looks for it:
+
+```bash
+cd linuxtips-gitops-argocd
+git add applications
+git commit -m "feat: add podinfo application"
+git push
+```
+
+Then the infrastructure repository:
+
+```bash
+cd linuxtips-gitops-gke
+git add argocd
+git commit -m "feat: add root application"
+git push
+```
+
+Only `argocd/` changed, so only the `argocd` jobs run. Approve **argocd / plan**. One resource to create:
+
+```txt
+  # helm_release.root will be created
+  ...
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+Approve **argocd / apply**.
+
+Open the Argo CD UI. There are two Applications:
+
+| Application | Status | Why |
+|---|---|---|
+| `root` | Synced, Healthy | it found `applications/podinfo.yaml` and created the `podinfo` Application |
+| `podinfo` | **OutOfSync**, Missing | its sync is manual, so it waits for us |
+
+## 5. Manual Sync
+
+Open `podinfo` and click **Sync → Synchronize**. After a few seconds it turns **Synced** and **Healthy**:
+
+```bash
+kubectl get all -n podinfo
+```
+
+The difference from Lesson 2: nobody filled in a form. The Application came from a file in Git, created by `root`.
+
+## 6. Drift: Changing the Cluster by Hand
+
+Now let's do what GitOps exists to prevent, on purpose, to see how Argo CD reacts. Delete the Deployment by hand:
+
+```bash
+kubectl delete deployment podinfo -n podinfo
+```
+
+Click **Refresh** on `podinfo`. It turns **OutOfSync**, and the Deployment shows as **Missing**. Argo CD noticed that the cluster no longer matches Git. This difference is called **drift**.
+
+With a manual sync policy, Argo CD only **reports** the drift. The app stays broken until someone clicks **Sync**. Click it to bring the Deployment back.
+
+## 7. Automated Sync and Self-Heal
+
+Now let Argo CD fix drift by itself. In `applications/podinfo.yaml`, uncomment the `automated` block:
+
+```yaml
+# applications/podinfo.yaml (excerpt)
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+```bash
+git commit -am "feat: enable automated sync for podinfo"
+git push
+```
+
+`root` picks up the change within a few minutes (click **Refresh** on `root` to speed it up), and the `podinfo` Application now shows **Auto sync is enabled**.
+
+| Option | What it does |
+|---|---|
+| `automated` | Argo CD syncs as soon as a refresh finds a difference between Git and the cluster |
+| `selfHeal: true` | changes made directly in the cluster are reverted to what Git says |
+| `prune: true` | a resource removed from Git is deleted from the cluster. Without it, it would be left behind and the app would show OutOfSync |
+
+Test self-heal by deleting the Deployment again:
+
+```bash
+kubectl delete deployment podinfo -n podinfo
+kubectl get deployment podinfo -n podinfo -w
+```
+
+It comes back by itself within seconds. `Ctrl+C` stops the `-w` (watch). That is GitOps working: the only way to change this app now is through Git.
+
+## 8. Changing the App Through Git
+
+The other direction: a change in Git reaches the cluster without anyone touching it. In `apps/podinfo/deployment.yaml`, change the message:
+
+```yaml
+# apps/podinfo/deployment.yaml (excerpt)
+          env:
+            - name: PODINFO_UI_MESSAGE
+              value: "Deployed by Argo CD from Git"
+```
+
+```bash
+git commit -am "feat: change podinfo message"
+git push
+```
+
+Within a few minutes (or right away, with **Refresh** on `podinfo`), Argo CD applies the change and Kubernetes replaces the Pods with new ones. Open podinfo to see the new message:
+
+```bash
+kubectl port-forward -n podinfo svc/podinfo 8081:80
+```
+
+Then **Web Preview → Change port → 8081**.
+
+Look at the `podinfo` Application in the UI: **Last Sync** shows the commit that was deployed. Git history is now the deployment history, and going back is a `git revert`.
+
+## Key Takeaways
+
+- A single **root** Application, created by Terraform, watches a folder in Git and creates every Application committed there. It is the last thing created outside Git.
+- Creating an Application is now a commit; nobody runs `kubectl apply` or clicks **New App**.
+- With a manual policy, Argo CD detects **drift** and waits; with `automated` + `selfHeal`, it fixes drift by itself; `prune` deletes what was removed from Git.
+- A change in Git reaches the cluster on its own, and Git history becomes the deployment history.
